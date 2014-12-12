@@ -81,7 +81,30 @@ fi
 
 MAKE_EXT4FS_CMD="make_ext4fs $ENABLE_SPARSE_IMAGE -T $TIMESTAMP $OPT -l $SIZE -a $MOUNT_POINT $OUTPUT_FILE $SRC_DIR"
 echo $MAKE_EXT4FS_CMD
+vmstat 1 &
+statpid=$!
 $MAKE_EXT4FS_CMD
 if [ $? -ne 0 ]; then
-  exit 4
+  echo "Ext image generation failed 1st time"
+  ps aux
+  echo "Image generation retry. 2nd time"
+  sleep 1m
+  echo $MAKE_EXT4FS_CMD
+  $MAKE_EXT4FS_CMD
+
+  if [ $? -ne 0 ]; then
+    echo "Ext image generation failed 2nd time"
+    ps aux
+    echo "Image generation retry. 3rd time"
+    sleep 3m
+    echo $MAKE_EXT4FS_CMD
+    $MAKE_EXT4FS_CMD
+
+    if [ $? -ne 0 ]; then
+      kill $statpid
+      exit 4
+    fi
+  fi
 fi
+kill $statpid
+
