@@ -87,6 +87,8 @@ $MAKE_EXT4FS_CMD
 if [ $? -ne 0 ]; then
   echo "Ext image generation failed 1st time"
   ps aux
+  lsof
+  ls -Rl $SRC_DIR
   echo "Image generation retry. 2nd time"
   sleep 1m
   echo $MAKE_EXT4FS_CMD
