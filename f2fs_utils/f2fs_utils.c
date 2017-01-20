@@ -53,7 +53,7 @@ static void reset_f2fs_info() {
 	config.fd = -1;
 	if (f2fs_sparse_file) {
 		sparse_file_destroy(f2fs_sparse_file);
-		f2fs_sparse_file = NULL;
+		f2fs_sparse_file = -1;
 	}
 }
 
@@ -73,6 +73,6 @@ int make_f2fs_sparse_fd(int fd, long long len,
 	sparse_file_write(f2fs_sparse_file, fd, /*gzip*/0, /*sparse*/1, /*crc*/0);
 	sparse_file_destroy(f2fs_sparse_file);
 	flush_sparse_buffs();
-	f2fs_sparse_file = NULL;
+	f2fs_sparse_file = -1;
 	return 0;
 }
