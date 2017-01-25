@@ -14,7 +14,8 @@ libext4_utils_src_files := \
     sha1.c \
     wipe.c \
     crc16.c \
-    ext4_sb.c
+    ext4_sb.c \
+    canned_fs_config.c
 
 #
 # -- All host/targets including windows
@@ -25,26 +26,31 @@ LOCAL_SRC_FILES := $(libext4_utils_src_files)
 LOCAL_MODULE := libext4_utils_host
 LOCAL_STATIC_LIBRARIES := \
     libsparse_host \
-    libz
+    libz \
+    liblz4-host
 ifneq ($(HOST_OS),windows)
   LOCAL_STATIC_LIBRARIES += libselinux
 endif
+LOCAL_C_INCLUDES += external/lz4/lib
+
 include $(BUILD_HOST_STATIC_LIBRARY)
 
 
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := make_ext4fs_main.c canned_fs_config.c
+LOCAL_SRC_FILES := make_ext4fs_main.c
 LOCAL_MODULE := make_ext4fs
 LOCAL_STATIC_LIBRARIES += \
     libext4_utils_host \
     libsparse_host \
-    libz
+    libz \
+    liblz4-host
 ifeq ($(HOST_OS),windows)
   LOCAL_LDLIBS += -lws2_32
 else
   LOCAL_STATIC_LIBRARIES += libselinux
   LOCAL_CFLAGS := -DHOST
 endif
+
 include $(BUILD_HOST_EXECUTABLE)
 
 
@@ -56,32 +62,48 @@ ifneq ($(HOST_OS),windows)
 
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := $(libext4_utils_src_files)
+LOCAL_C_INCLUDES += external/zlib
 LOCAL_MODULE := libext4_utils
 LOCAL_SHARED_LIBRARIES := \
     libselinux \
     libsparse \
     libz
+LOCAL_STATIC_LIBRARIES += liblz4-static
+LOCAL_C_INCLUDES += external/lz4/lib
+
+ifeq ($(BOARD_SUPPRESS_EMMC_WIPE),true)
+    LOCAL_CFLAGS += -DSUPPRESS_EMMC_WIPE
+endif
+
 include $(BUILD_SHARED_LIBRARY)
 
 
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := $(libext4_utils_src_files)
+LOCAL_C_INCLUDES += external/zlib
 LOCAL_MODULE := libext4_utils_static
 LOCAL_STATIC_LIBRARIES += \
     libselinux \
     libsparse_static
+LOCAL_C_INCLUDES += external/lz4/lib
+
+ifeq ($(BOARD_SUPPRESS_EMMC_WIPE),true)
+    LOCAL_CFLAGS += -DSUPPRESS_EMMC_WIPE
+endif
+
 include $(BUILD_STATIC_LIBRARY)
 
 
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := make_ext4fs_main.c canned_fs_config.c
+LOCAL_SRC_FILES := make_ext4fs_main.c
 LOCAL_MODULE := make_ext4fs
 LOCAL_SHARED_LIBRARIES := \
     libext4_utils \
     libselinux \
     libz
+LOCAL_C_INCLUDES += external/lz4/lib
+LOCAL_STATIC_LIBRARIES += liblz4-static
 include $(BUILD_EXECUTABLE)
-
 
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := ext2simg.c
@@ -93,6 +115,25 @@ LOCAL_SHARED_LIBRARIES += \
     libz
 include $(BUILD_EXECUTABLE)
 
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := make_ext4fs_recovery
+LOCAL_MODULE_STEM := make_ext4fs
+LOCAL_FORCE_STATIC_EXECUTABLE := true
+LOCAL_MODULE_TAGS := optional
+LOCAL_MODULE_CLASS := RECOVERY_EXECUTABLES
+LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/sbin
+LOCAL_UNSTRIPPED_PATH := $(PRODUCT_OUT)/symbols/recovery
+LOCAL_SRC_FILES := make_ext4fs_main.c canned_fs_config.c
+LOCAL_C_INCLUDES += external/lz4/lib
+LOCAL_STATIC_LIBRARIES := \
+    libext4_utils_static \
+    libsparse_static \
+    libselinux \
+    libc \
+    libmincrypt  \
+    libz
+include $(BUILD_EXECUTABLE)
 
 include $(CLEAR_VARS)
 LOCAL_SRC_FILES := ext2simg.c

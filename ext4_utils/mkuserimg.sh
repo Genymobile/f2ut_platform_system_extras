@@ -6,7 +6,7 @@ function usage() {
 cat<<EOT
 Usage:
 mkuserimg.sh [-s] SRC_DIR OUTPUT_FILE EXT_VARIANT MOUNT_POINT SIZE [-j <journal_size>]
-             [-T TIMESTAMP] [-C FS_CONFIG] [-B BLOCK_LIST_FILE] [FILE_CONTEXTS]
+             [-T TIMESTAMP] [-C FS_CONFIG] [-B BLOCK_LIST_FILE] [-M METHOD] [FILE_CONTEXTS]
 EOT
 }
 
@@ -61,7 +61,14 @@ if [[ "$1" == "-B" ]]; then
   shift; shift
 fi
 
+XCOMP_METHOD=
+if [[ "$1" == "-M" ]]; then
+  XCOMP_METHOD=$2
+  shift; shift
+fi
+
 FC=$1
+LABEL=""
 
 case $EXT_VARIANT in
   ext4) ;;
@@ -72,6 +79,18 @@ if [ -z $MOUNT_POINT ]; then
   echo "Mount point is required"
   exit 2
 fi
+
+case $MOUNT_POINT in
+  "system")
+    LABEL="-L SYSTEM"
+    ;;
+  "data")
+    LABEL="-L USERDATA"
+    ;;
+  "cache")
+    LABEL="-L CACHE"
+    ;;
+esac
 
 if [ -z $SIZE ]; then
   echo "Need size of filesystem"
@@ -88,35 +107,13 @@ fi
 if [ -n "$BLOCK_LIST" ]; then
   OPT="$OPT -B $BLOCK_LIST"
 fi
+if [ -n "$XCOMP_METHOD" ]; then
+  OPT="$OPT -M $XCOMP_METHOD"
+fi
 
-MAKE_EXT4FS_CMD="make_ext4fs $ENABLE_SPARSE_IMAGE -T $TIMESTAMP $OPT -l $SIZE $JOURNAL_FLAGS -a $MOUNT_POINT $OUTPUT_FILE $SRC_DIR"
+MAKE_EXT4FS_CMD="make_ext4fs $ENABLE_SPARSE_IMAGE -T $TIMESTAMP $OPT -l $SIZE $JOURNAL_FLAGS -a $MOUNT_POINT $LABEL $OUTPUT_FILE $SRC_DIR"
 echo $MAKE_EXT4FS_CMD
-vmstat 1 &
-statpid=$!
 $MAKE_EXT4FS_CMD
 if [ $? -ne 0 ]; then
-  echo "Ext image generation failed 1st time"
-  ps aux
-  lsof
-  ls -Rl $SRC_DIR
-  echo "Image generation retry. 2nd time"
-  sleep 1m
-  echo $MAKE_EXT4FS_CMD
-  $MAKE_EXT4FS_CMD
-
-  if [ $? -ne 0 ]; then
-    echo "Ext image generation failed 2nd time"
-    ps aux
-    echo "Image generation retry. 3rd time"
-    sleep 3m
-    echo $MAKE_EXT4FS_CMD
-    $MAKE_EXT4FS_CMD
-
-    if [ $? -ne 0 ]; then
-      kill $statpid
-      exit 4
-    fi
-  fi
+  exit 4
 fi
-kill $statpid
-

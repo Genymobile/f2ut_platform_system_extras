@@ -175,7 +175,7 @@ u32 make_directory(u32 dir_inode_num, u32 entries, struct dentry *dentries,
 }
 
 /* Creates a file on disk.  Returns the inode number of the new file */
-u32 make_file(const char *filename, u64 len)
+u32 make_file(const char *filename, const char *datafile, u64 len)
 {
 	struct ext4_inode *inode;
 	u32 inode_num;
@@ -193,7 +193,7 @@ u32 make_file(const char *filename, u64 len)
 	}
 
 	if (len > 0) {
-		struct block_allocation* alloc = inode_allocate_file_extents(inode, len, filename);
+		struct block_allocation* alloc = inode_allocate_file_extents(inode, len, datafile);
 		if (alloc) {
 			alloc->filename = strdup(filename);
 			alloc->next = saved_allocation_head;
@@ -257,6 +257,18 @@ int inode_set_permissions(u32 inode_num, u16 mode, u16 uid, u16 gid, u32 mtime)
 	inode->i_mtime = mtime;
 	inode->i_atime = mtime;
 	inode->i_ctime = mtime;
+
+	return 0;
+}
+
+int inode_set_extra_flags(u32 inode_num, u32 flags)
+{
+	struct ext4_inode *inode = get_inode(inode_num);
+
+	if (!inode)
+		return -1;
+
+	inode->i_flags |= flags;
 
 	return 0;
 }

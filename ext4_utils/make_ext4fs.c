@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#define _FILE_OFFSET_BITS 64
+#define _LARGEFILE64_SOURCE 1
+
 #include "make_ext4fs.h"
 #include "ext4_utils.h"
 #include "allocate.h"
@@ -60,6 +63,8 @@
 
 #else
 
+#include <zlib.h>
+
 #include <selinux/selinux.h>
 #include <selinux/label.h>
 #include <selinux/android.h>
@@ -67,6 +72,9 @@
 #define O_BINARY 0
 
 #endif
+
+#include <lz4.h>
+#include <lz4hc.h>
 
 /* TODO: Not implemented:
    Allocating blocks in the same block group as the file inode
@@ -118,6 +126,236 @@ static u32 build_default_directory_structure(const char *dir_path,
 }
 
 #ifndef USE_MINGW
+static u32 files_total;
+static u32 files_compressed;
+static u64 bytes_total;
+static u64 bytes_compressed;
+static char **tmp_filenames;
+static u32 nr_tmp_filenames;
+static char *alloc_tmp_filename(const char *filename)
+{
+	char *tmp_filename = malloc(strlen(filename) + 4 + 1);
+	sprintf(tmp_filename, "%s.tmp", filename);
+	tmp_filenames = (char **)realloc(tmp_filenames,
+					 (nr_tmp_filenames+1) * sizeof(char *));
+	tmp_filenames[nr_tmp_filenames] = tmp_filename;
+	++nr_tmp_filenames;
+	return tmp_filename;
+}
+
+static void free_tmp_files(void)
+{
+	u32 n;
+	for (n = 0; n < nr_tmp_filenames; ++n) {
+		unlink(tmp_filenames[n]);
+		free(tmp_filenames[n]);
+	}
+	free(tmp_filenames);
+	tmp_filenames = NULL;
+	nr_tmp_filenames = 0;
+}
+
+static uint32_t compressbound_zlib(uint32_t len)
+{
+	uint32_t max;
+	z_stream strm;
+
+	memset(&strm, 0, sizeof(strm));
+	deflateInit(&strm, Z_DEFAULT_COMPRESSION);
+	max = deflateBound(&strm, len);
+	deflateEnd(&strm);
+
+	return max;
+}
+
+static uint32_t compress_zlib(const unsigned char *ibuf, uint32_t isize,
+		unsigned char *obuf, uint32_t osize)
+{
+	z_stream strm;
+	int ret = -1;
+
+	memset(&strm, 0, sizeof(strm));
+	ret = deflateInit(&strm, Z_DEFAULT_COMPRESSION);
+
+	strm.avail_in = isize;
+	strm.next_in = (unsigned char *)ibuf;
+	strm.avail_out = osize;
+	strm.next_out = (unsigned char *)obuf;
+
+	ret = deflate(&strm, Z_FINISH);
+	deflateEnd(&strm);
+	if (ret != Z_STREAM_END || strm.avail_in != 0) {
+		ret = -1;
+		return -1;
+	}
+
+	return strm.avail_out;
+}
+
+static uint32_t compressbound_lz4(uint32_t len)
+{
+	// We don't use lz4, but we need a better workaround then this
+	return NULL;
+	//return LZ4_compressBound(len);
+}
+
+static uint32_t compress_lz4(const unsigned char *ibuf, uint32_t isize,
+		unsigned char *obuf, uint32_t osize)
+{
+	// We don't use lz4, but we need a better workaround then this
+	return NULL;
+	//return LZ4_compressHC((const char *)ibuf, (char *)obuf, isize);
+}
+
+struct compress_entry {
+	const char	*method;
+	int		method_index; /* Must match kernel */
+	unsigned char	blocksize;
+	uint32_t	(*compressbound)(uint32_t len);
+	uint32_t	(*compress)(const unsigned char *, uint32_t, unsigned char *, uint32_t);
+};
+
+static const struct compress_entry compress_table[] = {
+	{ "zlib", 1, 16, compressbound_zlib, compress_zlib },
+	{ "lz4",  2, 16, compressbound_lz4, compress_lz4 },
+	{ NULL, 0, 0, NULL, NULL }
+};
+
+static const struct compress_entry *find_compress_entry(const char *method)
+{
+	unsigned int idx;
+	for (idx = 0; compress_table[idx].method != NULL; ++idx) {
+		if (!strcmp(method, compress_table[idx].method)) {
+			return &compress_table[idx];
+		}
+	}
+	return NULL;
+}
+
+#define XCOMP_BUFSIZE (64*1024)
+static const unsigned char xcomp_magic[4] = { 'z', 'z', 'z', 'z' };
+static int compress_file(const char *method, const char *ifile, const char *ofile)
+{
+	const struct compress_entry *ent;
+	int ifd, ofd;
+	struct stat st;
+	uint64_t orig_size;
+	unsigned char *ibuf = NULL;
+	unsigned char *obuf = NULL;
+	uint32_t blksize;
+	uint32_t nr_blocks;
+	uint32_t hdr_entlen;
+	uint32_t max_blksize;
+	uint32_t hdrlen;
+	unsigned char *hdrbuf;
+	unsigned char *writebuf;
+	unsigned char *hdr_ent;
+	uint32_t obufsize;
+	uint32_t isize, osize;
+	off_t ipos;
+	int ret = -1;
+
+	ent = find_compress_entry(method);
+	if (ent == NULL)
+		return -1;
+
+	unlink(ofile);
+	ifd = open(ifile, O_RDONLY);
+	ofd = open(ofile, O_WRONLY | O_CREAT, 0666);
+	if (ifd < 0 || ofd < 0)
+		goto out;
+
+	if (fstat(ifd, &st) != 0)
+		goto out;
+	orig_size = cpu_to_le64(st.st_size);
+
+	obufsize = ent->compressbound(XCOMP_BUFSIZE);
+	ibuf = (unsigned char *)malloc(XCOMP_BUFSIZE);
+	obuf = (unsigned char *)malloc(obufsize);
+	if (!ibuf || !obuf) {
+		fprintf(stderr, "Unable to allocate compression buffers!\n");
+		goto out;
+	}
+
+	blksize = 1 << ent->blocksize;
+	nr_blocks = DIV_ROUND_UP(st.st_size, blksize);
+	hdr_entlen = (ent->blocksize > 16) ? 4 : 2;
+	max_blksize = (ent->blocksize > 16) ? 0xfffffffe : 0xfffe;
+	hdrlen = 12 + hdr_entlen * nr_blocks;
+	hdrbuf = (unsigned char *)malloc(hdrlen);
+	if (!hdrbuf) {
+		fprintf(stderr, "Unable to allocate header buffer!\n");
+		goto out;
+	}
+	memset(hdrbuf, 0, hdrlen);
+
+	memcpy(hdrbuf, xcomp_magic, 4);
+	hdrbuf[4] = ent->method_index | (0 << 4);
+	hdrbuf[5] = ent->blocksize;
+	memcpy(hdrbuf+6, &orig_size, 6);
+
+	ret = write(ofd, hdrbuf, hdrlen);
+	if (ret != (ssize_t)hdrlen) {
+		fprintf(stderr, "Unable to write header!\n");
+		goto out;
+	}
+
+	ipos = 0;
+	hdr_ent = hdrbuf + 12;
+	do {
+		uint32_t entval;
+		isize = min(blksize, st.st_size - ipos);
+		ret = read(ifd, ibuf, XCOMP_BUFSIZE);
+		if (ret != (ssize_t)isize) {
+			fprintf(stderr, "Unable to read input file!\n");
+			ret = -1;
+			goto out;
+		}
+		ipos += isize;
+		osize = ent->compress(ibuf, isize, obuf, obufsize);
+		if (osize < isize && osize < max_blksize) {
+			writebuf = obuf;
+			entval = cpu_to_le32(osize);
+		}
+		else {
+			writebuf = ibuf;
+			osize = isize;
+			entval = cpu_to_le32(0);
+		}
+		memcpy(hdr_ent, &entval, hdr_entlen);
+		hdr_ent += hdr_entlen;
+		ret = write(ofd, writebuf, osize);
+		if ((uint32_t)ret != osize) {
+			fprintf(stderr, "Unable to write output file\n!");
+			ret = -1;
+			goto out;
+		}
+	}
+	while (ipos != st.st_size);
+
+	ret = lseek(ofd, 0, SEEK_SET);
+	if (ret != 0) {
+		fprintf(stderr, "Unable to seek for header!\n");
+		ret = -1;
+		goto out;
+	}
+	ret = write(ofd, hdrbuf, hdrlen);
+	if (ret != hdrlen) {
+		fprintf(stderr, "Unable to write header!\n");
+		ret = -1;
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	close(ofd);
+	close(ifd);
+	free(ibuf);
+	free(obuf);
+	return ret;
+}
+
 /* Read a local directory and create the same tree in the generated filesystem.
    Calls itself recursively with each directory in the given directory.
    full_path is an absolute or relative path, with a trailing slash, to the
@@ -127,7 +365,8 @@ static u32 build_default_directory_structure(const char *dir_path,
    if the image were mounted at the specified mount point */
 static u32 build_directory_structure(const char *full_path, const char *dir_path,
 		u32 dir_inode, fs_config_func_t fs_config_func,
-		struct selabel_handle *sehnd, int verbose, time_t fixed_time)
+		struct selabel_handle *sehnd, int verbose, time_t fixed_time,
+		const char *xcomp_method)
 {
 	int entries = 0;
 	struct dentry *dentries;
@@ -199,7 +438,7 @@ static u32 build_directory_structure(const char *full_path, const char *dir_path
 		uint64_t capabilities;
 		if (fs_config_func != NULL) {
 #ifdef ANDROID
-			unsigned int mode = 0;
+			unsigned int mode = stat.st_mode;
 			unsigned int uid = 0;
 			unsigned int gid = 0;
 			int dir = S_ISDIR(stat.st_mode);
@@ -274,8 +513,31 @@ static u32 build_directory_structure(const char *full_path, const char *dir_path
 	inode = make_directory(dir_inode, entries, dentries, dirs);
 
 	for (i = 0; i < entries; i++) {
+		int compress = 0;
 		if (dentries[i].file_type == EXT4_FT_REG_FILE) {
-			entry_inode = make_file(dentries[i].full_path, dentries[i].size);
+			const char* path = dentries[i].full_path;
+			const char* datapath = path;
+			unsigned long datasize = dentries[i].size;
+			struct stat st;
+			files_total++;
+			bytes_total += datasize;
+			if (xcomp_method && datasize > 1 * info.block_size) {
+				const char* tmppath = alloc_tmp_filename(path);
+				if (compress_file(xcomp_method, path, tmppath) != 0) {
+					critical_error_errno("compress_file");
+				}
+				if (lstat(tmppath, &st) != 0)
+					critical_error_errno("lstat");
+				if (DIV_ROUND_UP(st.st_size, info.block_size) <
+				    DIV_ROUND_UP(datasize, info.block_size)) {
+					compress = 1;
+					datapath = tmppath;
+					datasize = st.st_size;
+					files_compressed++;
+					bytes_compressed += st.st_size;
+				}
+			}
+			entry_inode = make_file(path, datapath, datasize);
 		} else if (dentries[i].file_type == EXT4_FT_DIR) {
 			char *subdir_full_path = NULL;
 			char *subdir_dir_path;
@@ -288,7 +550,8 @@ static u32 build_directory_structure(const char *full_path, const char *dir_path
 			if (ret < 0)
 				critical_error_errno("asprintf");
 			entry_inode = build_directory_structure(subdir_full_path,
-					subdir_dir_path, inode, fs_config_func, sehnd, verbose, fixed_time);
+					subdir_dir_path, inode, fs_config_func, sehnd,
+					verbose, fixed_time, xcomp_method);
 			free(subdir_full_path);
 			free(subdir_dir_path);
 		} else if (dentries[i].file_type == EXT4_FT_SYMLINK) {
@@ -304,6 +567,12 @@ static u32 build_directory_structure(const char *full_path, const char *dir_path
 			dentries[i].mtime);
 		if (ret)
 			error("failed to set permissions on %s\n", dentries[i].path);
+
+		if (compress) {
+			ret = inode_set_extra_flags(entry_inode, EXT4_COMPR_FL);
+			if (ret)
+				error("failed to set EXT4_COMPR_FL on %s\n", dentries[i].path);
+		}
 
 		/*
 		 * It's important to call inode_set_selinux() before
@@ -406,7 +675,7 @@ int make_ext4fs_sparse_fd(int fd, long long len,
 	reset_ext4fs_info();
 	info.len = len;
 
-	return make_ext4fs_internal(fd, NULL, mountpoint, NULL, 0, 1, 0, 0, sehnd, 0, -1, NULL);
+	return make_ext4fs_internal(fd, NULL, mountpoint, NULL, 0, 1, 0, 0, sehnd, 0, -1, NULL, NULL);
 }
 
 int make_ext4fs(const char *filename, long long len,
@@ -424,7 +693,7 @@ int make_ext4fs(const char *filename, long long len,
 		return EXIT_FAILURE;
 	}
 
-	status = make_ext4fs_internal(fd, NULL, mountpoint, NULL, 0, 0, 0, 1, sehnd, 0, -1, NULL);
+	status = make_ext4fs_internal(fd, NULL, mountpoint, NULL, 0, 0, 0, 1, sehnd, 0, -1, NULL, NULL);
 	close(fd);
 
 	return status;
@@ -494,12 +763,15 @@ int make_ext4fs_internal(int fd, const char *_directory,
 						 const char *_mountpoint, fs_config_func_t fs_config_func, int gzip,
 						 int sparse, int crc, int wipe,
 						 struct selabel_handle *sehnd, int verbose, time_t fixed_time,
-						 FILE* block_list_file)
+						 FILE* block_list_file,
+						 const char *xcomp_method)
 {
 	u32 root_inode_num;
 	u16 root_mode;
 	char *mountpoint;
 	char *directory = NULL;
+	char **tmp_files = NULL;
+	u32 nr_tmp_files, n;
 
 	if (setjmp(setjmp_env))
 		return EXIT_FAILURE; /* Handle a call to longjmp() */
@@ -574,6 +846,8 @@ int make_ext4fs_internal(int fd, const char *_directory,
 	printf("    Inode size: %d\n", info.inode_size);
 	printf("    Journal blocks: %d\n", info.journal_blocks);
 	printf("    Label: %s\n", info.label);
+	printf("    Transparent compression: %s\n",
+			(xcomp_method ? xcomp_method : "none"));
 
 	ext4_create_fs_aux_info();
 
@@ -603,7 +877,7 @@ int make_ext4fs_internal(int fd, const char *_directory,
 #else
 	if (directory)
 		root_inode_num = build_directory_structure(directory, mountpoint, 0,
-			fs_config_func, sehnd, verbose, fixed_time);
+			fs_config_func, sehnd, verbose, fixed_time, xcomp_method);
 	else
 		root_inode_num = build_default_directory_structure(mountpoint, sehnd);
 #endif
@@ -655,11 +929,20 @@ int make_ext4fs_internal(int fd, const char *_directory,
 			aux_info.sb->s_blocks_count_lo - aux_info.sb->s_free_blocks_count_lo,
 			aux_info.sb->s_blocks_count_lo);
 
+	printf("    Total files: %d\n", files_total);
+	printf("    Total bytes: %"PRIu64"\n", bytes_total);
+	if (xcomp_method) {
+		printf("    Compressed files: %d\n", files_compressed);
+		printf("    Compressed bytes: %"PRIu64"\n", bytes_compressed);
+	}
+
 	if (wipe && WIPE_IS_SUPPORTED) {
 		wipe_block_device(fd, info.len);
 	}
 
 	write_ext4_image(fd, gzip, sparse, crc);
+
+	free_tmp_files();
 
 	sparse_file_destroy(ext4_sparse_file);
 	ext4_sparse_file = NULL;

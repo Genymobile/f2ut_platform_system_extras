@@ -2,7 +2,7 @@
 
 LOCAL_PATH:= $(call my-dir)
 
-ifeq ($(HOST_OS),linux)
+ifneq (,$(filter linux darwin,$(HOST_OS)))
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := libf2fs_utils_host
@@ -38,7 +38,7 @@ LOCAL_MODULE := make_f2fs
 LOCAL_LDFLAGS := -ldl -rdynamic
 # The following libf2fs_* are from system/extras/f2fs_utils,
 # and do not use code in external/f2fs-tools.
-LOCAL_STATIC_LIBRARIES := libf2fs_utils_host libf2fs_ioutils_host libf2fs_dlutils_host
+LOCAL_STATIC_LIBRARIES := libf2fs_utils_host libf2fs_dlutils_host
 LOCAL_REQUIRED_MODULES := libf2fs_fmt_host_dyn
 LOCAL_STATIC_LIBRARIES += \
     libsparse_host \
@@ -68,6 +68,15 @@ LOCAL_STATIC_LIBRARIES := \
 include $(BUILD_STATIC_LIBRARY)
 
 endif
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libf2fs_sparseblock
+LOCAL_SRC_FILES := f2fs_sparseblock.c
+LOCAL_CFLAGS += -DSTATIC_LIB
+LOCAL_STATIC_LIBRARIES := libcutils
+LOCAL_C_INCLUDES := external/f2fs-tools/include \
+		system/core/include/log
+include $(BUILD_STATIC_LIBRARY)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := libf2fs_sparseblock
